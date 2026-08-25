@@ -1,6 +1,6 @@
 import streamlit as st
 from pathlib import Path
-from xiaohongshu4_core import adjust_strategy, analyze, api_analyze4, api_analyze4_stream, api_continue4_stream, check_similarity, classify_api_error, compare_own_content, content_templates, parse_api_markdown, parse_api_plans, read_csv, read_feedback, review_summary, save_review
+from xiaohongshu4_core import adjust_strategy, analyze, api_analyze4, api_analyze4_stream, check_similarity, classify_api_error, compare_own_content, content_templates, parse_api_markdown, parse_api_plans, read_csv, read_feedback, review_summary, save_review
 
 st.set_page_config(page_title="对标账号学习 Agent", page_icon="📊", layout="wide")
 st.title("小红书对标账号学习与差异化内容 Agent")
@@ -108,6 +108,8 @@ if st.session_state.get("api4_result"):
         if st.button("继续生成 API 结果", key="continue_api4"):
             settings = st.session_state["api4"]
             try:
+                # Keep the app bootable while a deployment is serving an older core module.
+                from xiaohongshu4_core import api_continue4_stream
                 with st.spinner("正在从中断位置继续生成..."):
                     continuation = "".join(api_continue4_stream(api_text, settings["key"], settings["base_url"], settings["model"], settings["timeout"], settings.get("wire_api", "responses"), settings.get("reasoning_effort", "medium")))
                 st.session_state["api4_result"] = api_text + continuation
