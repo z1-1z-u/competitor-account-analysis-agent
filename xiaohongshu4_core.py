@@ -2,12 +2,32 @@ import csv
 import io
 import sqlite3
 import json
+import re
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 REQUIRED = {"account_id", "account_name", "account_positioning", "post_id", "title", "content", "hashtags", "publish_time", "likes", "collects", "comments", "is_viral"}
 DB_PATH = Path(__file__).with_name("reviews.db")
+
+
+def classify_api_error(error: Exception) -> str:
+    text = str(error).lower()
+    if any(key in text for key in ("401", "403", "api key", "authentication", "unauthorized")):
+        return "认证失败：请检查 API Key。"
+    if any(key in text for key in ("404", "model_not_found", "unknown model")):
+        return "模型或接口不存在：请检查模型名称和 Base URL。"
+    if any(key in text for key in ("413", "context", "too large", "最大", "token")):
+        return "请求内容过大：请切换轻量模式或缩短笔记正文。"
+    if any(key in text for key in ("timeout", "timed out", "连接", "connection", "temporarily", "429", "rate limit", "503", "502")):
+        return "网络或服务暂时不可用：可以稍后重试。"
+    if "html" in text:
+        return "Base URL 配置错误：接口返回了网页，请填写带 /v1 的 API 地址。"
+    return "API 请求失败：请检查 API 配置、网络和模型兼容性。"
+
+
+def _reasoning_kwargs(reasoning_effort: str) -> dict[str, Any]:
+    return {"reasoning": {"effort": reasoning_effort}} if reasoning_effort and reasoning_effort != "none" else {}
 
 
 def number(value: Any) -> int:
@@ -215,7 +235,7 @@ def api_analyze4(posts: list[dict[str, Any]], result: dict[str, Any], api_key: s
     if not api_key.strip():
         raise ValueError("API Key 不能为空")
     client = OpenAI(api_key=api_key.strip(), base_url=base_url.strip() or None,
-                    timeout=timeout_seconds, max_retries=0)
+                    timeout=timeout_seconds, max_retries=2)
     selected_posts = posts
     if lightweight:
         selected_posts = sorted(posts, key=lambda item: item["engagement"], reverse=True)[:3]
@@ -227,9 +247,11 @@ def api_analyze4(posts: list[dict[str, Any]], result: dict[str, Any], api_key: s
         } for p in selected_posts]
     prompt = (
         "你是对标账号研究与内容策略分析师。请基于输入的公开笔记数据完成第4题分析。\n"
-        "重点输出：1. 高表现内容的真实选题及用户需求；2. 可借鉴的内容机制与不能照搬的具体表达；"
-        "3. 为我方账号生成差异化内容计划；4. 检查相似和抄袭风险；5. 给出后续学习策略。\n"
-        "不得复制原文、书摘、案例和图片描述，不确定的信息标记需要人工确认。请输出结构清晰的中文 Markdown。\n\n" +
+        "只输出中文 Markdown，不要输出前言、代码块或 JSON，并严格使用以下一级标题：\n"
+        "# 账号与高表现分析\n# 可借鉴机制与风险\n# 差异化内容计划\n# 后续策略\n"
+        "在‘差异化内容计划’下必须输出恰好 3 条二级计划，每条严格包含：\n"
+        "## 计划 1：<角度>\n标题：<完整标题>\n角度：<差异化角度>\nHook：<开头抓手>\n关键词：<关键词>\n结构：<内容结构>\n图片建议：<原创图片建议>\nCTA：<互动引导>\n风险：<需要人工核验或避免照搬的内容>\n"
+        "计划 2、计划 3 使用完全相同字段。不得复制原文、书摘、案例和图片描述，不确定的信息标记需要人工确认。\n\n" +
         ("这是轻量模式，只分析互动最高的 3 篇笔记摘要。请优先快速返回结果。\n" if lightweight else "") +
         "分析摘要：\n" + json.dumps({
             "profiles": result["profiles"], "topic_summary": result["topic_summary"],
@@ -239,29 +261,88 @@ def api_analyze4(posts: list[dict[str, Any]], result: dict[str, Any], api_key: s
     )
     selected_model = model.strip() or "gpt-4o-mini"
     if wire_api == "responses":
-        response = client.responses.create(
-            model=selected_model,
-            input=prompt,
-            reasoning={"effort": reasoning_effort},
-        )
+        kwargs = {"model": selected_model, "input": prompt, **_reasoning_kwargs(reasoning_effort)}
+        try:
+            response = client.responses.create(**kwargs)
+        except Exception as error:
+            if "reason" not in str(error).lower():
+                raise
+            response = client.responses.create(model=selected_model, input=prompt)
     else:
         response = client.chat.completions.create(
             model=selected_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
         )
+    return extract_api_text(response)
+
+
+def extract_api_text(response: Any) -> str:
+    """Normalize text returned by OpenAI SDKs and compatible gateways."""
     if isinstance(response, str):
-        return response.strip()
-    if isinstance(response, dict):
-        if response.get("output_text"):
-            return str(response["output_text"]).strip()
+        text = response.strip()
+    elif isinstance(response, dict):
         choices = response.get("choices") or []
-        content = (choices[0].get("message", {}).get("content") if choices else None) or response.get("output_text", "")
-        return str(content).strip()
-    choices = getattr(response, "choices", None) or []
-    if choices:
-        return str(getattr(getattr(choices[0], "message", None), "content", "") or "").strip()
-    return str(getattr(response, "output_text", "") or "").strip()
+        message = choices[0].get("message", {}) if choices else {}
+        text = response.get("output_text") or message.get("content") or (choices[0].get("text") if choices else None) or response.get("content") or ""
+    else:
+        choices = getattr(response, "choices", None) or []
+        message = getattr(choices[0], "message", None) if choices else None
+        text = getattr(response, "output_text", None) or getattr(message, "content", None) or (getattr(choices[0], "text", None) if choices else None) or ""
+    text = str(text).strip()
+    if re.match(r"^\s*<(?:!doctype\s+html|html)\b", text, re.IGNORECASE):
+        raise RuntimeError("接口返回了 HTML 网页而不是模型结果，请将 Base URL 改为 API 地址（通常需要 /v1）。")
+    return text or "模型没有返回内容。"
+
+
+def parse_api_markdown(markdown: str) -> dict[str, str]:
+    """Split flexible model Markdown into readable analysis sections."""
+    sections = {"账号与高表现分析": [], "可借鉴机制与风险": [], "差异化内容计划": [], "后续策略": [], "其他": []}
+    aliases = {
+        "账号": "账号与高表现分析", "高表现": "账号与高表现分析", "选题": "账号与高表现分析",
+        "机制": "可借鉴机制与风险", "风险": "可借鉴机制与风险", "照搬": "可借鉴机制与风险",
+        "计划": "差异化内容计划", "原创": "差异化内容计划", "差异化": "差异化内容计划",
+        "策略": "后续策略", "后续": "后续策略", "学习": "后续策略",
+    }
+    current = "账号与高表现分析"
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        heading = re.sub(r"^[#\d.、)\s-]+", "", line).strip(" ：:．")
+        matched = next((target for key, target in aliases.items() if key in heading), None)
+        if matched:
+            current = matched
+            continue
+        sections[current].append(line)
+    parsed = {key: "\n\n".join(value).strip() for key, value in sections.items()}
+    if not any(parsed.values()):
+        parsed["账号与高表现分析"] = markdown.strip()
+    return parsed
+
+
+def parse_api_plans(markdown: str) -> list[dict[str, Any]]:
+    """Parse the fixed API plan template into the app's native plan shape."""
+    section_match = re.search(r"(?ims)^#\s*差异化内容计划\s*$\n?(.*?)(?=^#\s+[^#]|\Z)", markdown)
+    section = section_match.group(1).strip() if section_match else ""
+    if not section:
+        return []
+    blocks = re.split(r"(?m)^#{2,4}\s*(?:计划|方案)\s*\d+[^\n]*$", section)
+    plans = []
+    for index, block in enumerate(blocks[1:] or [section], 1):
+        def field(name: str) -> str:
+            match = re.search(rf"(?mis)^\s*{name}\s*[：:]\s*(.*?)(?=^\s*(?:标题|角度|Hook|钩子|关键词|内容关键词|结构|图片建议|CTA|互动引导|风险)\s*[：:]|\Z)", block)
+            return match.group(1).strip() if match else ""
+        title = field("标题")
+        if not title:
+            continue
+        plans.append({
+            "plan_id": f"API-P{index}", "title": title, "angle": field("角度") or f"API 差异化角度 {index}",
+            "hook": field("Hook") or field("钩子"), "content_keywords": field("关键词") or field("内容关键词"),
+            "structure": field("结构"), "image_suggestion": field("图片建议"),
+            "cta": field("CTA") or field("互动引导"), "risk": field("风险") or "使用原创案例和素材，发布前人工核验",
+        })
+    return plans
 
 
 def api_analyze4_stream(posts: list[dict[str, Any]], result: dict[str, Any], api_key: str,
@@ -276,24 +357,91 @@ def api_analyze4_stream(posts: list[dict[str, Any]], result: dict[str, Any], api
     if not api_key.strip():
         raise ValueError("API Key 不能为空")
     client = OpenAI(api_key=api_key.strip(), base_url=base_url.strip() or None,
-                    timeout=timeout_seconds, max_retries=0)
+                     timeout=timeout_seconds, max_retries=2)
     selected_posts = sorted(posts, key=lambda item: item["engagement"], reverse=True)[:3] if lightweight else posts
     post_data = [{"account_name": p["account_name"], "title": p["title"], "content": p["content"][:220] if lightweight else p["content"], "hashtags": p["hashtags"], "likes": p["likes"], "collects": p["collects"], "comments": p["comments"], "engagement": p["engagement"]} for p in selected_posts]
     prompt = (
         "你是对标账号研究与内容策略分析师。请基于公开笔记完成第4题分析。\n"
-        "输出：高表现选题、可借鉴机制与不能照搬表达、我方差异化计划、标题和内容关键词相似度风险、后续策略。\n"
-        "不得复制原文、书摘、案例和图片描述；不确定内容标记需要人工确认。输出中文 Markdown。\n"
+        "只输出中文 Markdown，并严格使用一级标题：账号与高表现分析、可借鉴机制与风险、差异化内容计划、后续策略。\n"
+        "差异化内容计划下必须恰好输出 3 条二级计划；每条必须包含：标题、角度、Hook、关键词、结构、图片建议、CTA、风险八个字段。\n"
+        "不得复制原文、书摘、案例和图片描述；不确定内容标记需要人工确认。\n"
         + ("这是轻量模式，只分析互动最高的3篇笔记摘要。\n" if lightweight else "")
         + json.dumps({"profiles": result["profiles"], "topic_summary": result["topic_summary"], "mechanisms": result["mechanisms"], "opportunities": result["opportunities"], "plans": result["plans"], "similarity": result["similarity"], "posts": post_data}, ensure_ascii=False)
     )
     selected_model = model.strip() or "gpt-4o-mini"
     if wire_api == "responses":
-        with client.responses.stream(model=selected_model, input=prompt, reasoning={"effort": reasoning_effort}) as stream:
+        kwargs = {"model": selected_model, "input": prompt}
+        if reasoning_effort != "none":
+            kwargs["reasoning"] = {"effort": reasoning_effort}
+        emitted = ""
+        try:
+            try:
+                stream = client.responses.create(**kwargs, stream=True)
+            except Exception as error:
+                if "reason" not in str(error).lower():
+                    raise
+                kwargs.pop("reasoning", None)
+                stream = client.responses.create(**kwargs, stream=True)
+            if stream is None:
+                raise RuntimeError("Responses API 没有返回流对象")
             for event in stream:
                 if getattr(event, "type", "") == "response.output_text.delta":
                     delta = getattr(event, "delta", "")
-                    if delta:
+                    if isinstance(delta, str) and delta:
+                        emitted += delta
                         yield delta
+        except Exception:
+            # Some compatible gateways expose Responses but do not support its
+            # streaming event schema. Return a synchronous result instead.
+            try:
+                response = client.responses.create(**kwargs)
+            except Exception as error:
+                if "reason" not in str(error).lower():
+                    raise
+                kwargs.pop("reasoning", None)
+                response = client.responses.create(**kwargs)
+            text = extract_api_text(response)
+            remainder = text[len(emitted):] if emitted and text.startswith(emitted) else text
+            if remainder:
+                yield remainder
+    else:
+        stream = client.chat.completions.create(model=selected_model, messages=[{"role": "user", "content": prompt}], temperature=0.7, stream=True)
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if choices:
+                delta = getattr(getattr(choices[0], "delta", None), "content", "") or ""
+                if delta:
+                    yield delta
+
+
+def api_continue4_stream(partial: str, api_key: str, base_url: str, model: str,
+                         timeout_seconds: int = 60, wire_api: str = "responses",
+                         reasoning_effort: str = "medium"):
+    """Continue an interrupted Markdown response from the last received text."""
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("未安装 openai，请执行 pip install openai") from exc
+    if not api_key.strip():
+        raise ValueError("API Key 不能为空")
+    client = OpenAI(api_key=api_key.strip(), base_url=base_url.strip() or None, timeout=timeout_seconds, max_retries=2)
+    prompt = ("请继续完成下面被中断的中文 Markdown 分析。不要重复已有内容，直接从截断位置继续，"
+              "并确保补齐固定模板中的差异化内容计划和后续策略。\n\n已生成内容：\n" + partial)
+    selected_model = model.strip() or "gpt-4o-mini"
+    if wire_api == "responses":
+        kwargs = {"model": selected_model, "input": prompt, **_reasoning_kwargs(reasoning_effort)}
+        try:
+            stream = client.responses.create(**kwargs, stream=True)
+        except Exception as error:
+            if "reason" not in str(error).lower():
+                raise
+            kwargs.pop("reasoning", None)
+            stream = client.responses.create(**kwargs, stream=True)
+        for event in stream:
+            if getattr(event, "type", "") == "response.output_text.delta":
+                delta = getattr(event, "delta", "")
+                if isinstance(delta, str) and delta:
+                    yield delta
     else:
         stream = client.chat.completions.create(model=selected_model, messages=[{"role": "user", "content": prompt}], temperature=0.7, stream=True)
         for chunk in stream:

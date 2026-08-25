@@ -1,6 +1,6 @@
 import streamlit as st
 from pathlib import Path
-from xiaohongshu4_core import adjust_strategy, analyze, api_analyze4, api_analyze4_stream, compare_own_content, content_templates, read_csv, read_feedback, review_summary, save_review
+from xiaohongshu4_core import adjust_strategy, analyze, api_analyze4, api_analyze4_stream, api_continue4_stream, check_similarity, classify_api_error, compare_own_content, content_templates, parse_api_markdown, parse_api_plans, read_csv, read_feedback, review_summary, save_review
 
 st.set_page_config(page_title="对标账号学习 Agent", page_icon="📊", layout="wide")
 st.title("小红书对标账号学习与差异化内容 Agent")
@@ -13,6 +13,9 @@ with st.sidebar:
     st.info("本模块不爬虫、不登录小红书，只分析你上传或人工整理的数据。")
     if "api4" not in st.session_state:
         st.session_state["api4"] = {"key": "", "base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "timeout": 60, "wire_api": "responses", "reasoning_effort": "medium"}
+    st.session_state.setdefault("api4_request_in_progress", False)
+    st.session_state.setdefault("api4_partial_result", "")
+    st.session_state.setdefault("api4_interrupted", False)
 
     @st.dialog("第 4 题 API 设置")
     def api_dialog():
@@ -32,7 +35,7 @@ with st.sidebar:
     st.caption("API：已配置" if st.session_state["api4"]["key"] else "API：未配置")
 
 # The bundled dataset is the user's real benchmark-account export.
-source = upload or Path(__file__).with_name("小红书不同账号对标.csv")
+source = upload or Path(__file__).with_name("xiaohongshu4_posts.csv")
 try:
     posts = read_csv(source)
 except Exception as error:
@@ -51,32 +54,81 @@ if not result:
 api_mode = st.checkbox("使用 API 深度分析", value=False)
 api_lightweight = st.radio("API 请求模式", ["轻量模式（推荐，发送高表现笔记摘要）", "完整模式（发送全部数据）"], horizontal=True)
 api_streaming = st.checkbox("使用流式输出（边生成边显示）", value=True, help="Responses API 和 Chat Completions API 均支持；结束后会保存完整结果")
-if api_mode and st.button("调用 API 分析", use_container_width=True):
+if api_mode and st.button("调用 API 分析", use_container_width=True, disabled=st.session_state["api4_request_in_progress"]):
     settings = st.session_state["api4"]
+    st.session_state["api4_request_in_progress"] = True
+    st.session_state["api4_partial_result"] = ""
+    st.session_state["api4_interrupted"] = False
     try:
-        with st.spinner("正在调用 API 分析对标选题和差异化策略..."):
+        with st.status("正在调用 API 分析对标选题和差异化策略...", expanded=True) as status:
             if api_streaming:
-                placeholder = st.empty()
-                collected = ""
-                for delta in api_analyze4_stream(posts, result, settings["key"], settings["base_url"], settings["model"], settings["timeout"], settings.get("wire_api", "responses"), settings.get("reasoning_effort", "medium"), api_lightweight.startswith("轻量")):
-                    collected += delta
-                    placeholder.markdown(collected)
-                st.session_state["api4_result"] = collected
+                def tracked_stream():
+                    collected = ""
+                    for delta in api_analyze4_stream(posts, result, settings["key"], settings["base_url"], settings["model"], settings["timeout"], settings.get("wire_api", "responses"), settings.get("reasoning_effort", "medium"), api_lightweight.startswith("轻量")):
+                        collected += delta
+                        st.session_state["api4_partial_result"] = collected
+                        yield delta
+                try:
+                    st.session_state["api4_result"] = st.write_stream(tracked_stream())
+                except Exception as stream_error:
+                    partial = st.session_state.get("api4_partial_result", "")
+                    if partial:
+                        st.warning(f"流式连接中断，已保留已接收的 {len(partial)} 个字符：{stream_error}")
+                        st.session_state["api4_result"] = partial
+                        st.session_state["api4_interrupted"] = True
+                    else:
+                        st.warning(f"流式接口不可用，正在尝试同步接口：{stream_error}")
+                        st.session_state["api4_result"] = api_analyze4(posts, result, settings["key"], settings["base_url"], settings["model"], settings["timeout"], settings.get("wire_api", "responses"), settings.get("reasoning_effort", "medium"), api_lightweight.startswith("轻量"))
             else:
                 st.session_state["api4_result"] = api_analyze4(posts, result, settings["key"], settings["base_url"], settings["model"], settings["timeout"], settings.get("wire_api", "responses"), settings.get("reasoning_effort", "medium"), api_lightweight.startswith("轻量"))
+            status.update(label="API 调用完成", state="complete", expanded=False)
     except Exception as error:
-        st.error(f"API 调用失败：{error}")
+        st.error(f"{classify_api_error(error)}\n\n详细信息：{error}")
         st.session_state["api4_result"] = None
+    finally:
+        st.session_state["api4_request_in_progress"] = False
 if st.session_state.get("api4_result"):
     st.subheader("API 深度分析结果")
     api_text = st.session_state["api4_result"]
     st.success(f"API 返回成功，共 {len(api_text)} 个字符")
-    st.markdown(api_text)
+    edited_api_text = st.text_area("可编辑的 API 最终稿", value=api_text, height=360, key="edited_api4_result")
+    view_raw = st.checkbox("直接显示 API 原始 Markdown", value=False)
+    if view_raw:
+        st.markdown(edited_api_text)
+    else:
+        parsed = parse_api_markdown(edited_api_text)
+        for section, content in parsed.items():
+            if content:
+                with st.expander(section, expanded=section in {"账号与高表现分析", "差异化内容计划"}):
+                    st.markdown(content)
     with st.expander("查看 API 原始文本"):
-        st.code(api_text, language="markdown")
-    st.download_button("导出 API 分析", api_text, "xiaohongshu4_api_analysis.md", "text/markdown")
+        st.code(edited_api_text, language="markdown")
+    st.download_button("导出 API 分析", edited_api_text, "xiaohongshu4_api_analysis.md", "text/markdown")
+    if st.session_state.get("api4_interrupted"):
+        if st.button("继续生成 API 结果", key="continue_api4"):
+            settings = st.session_state["api4"]
+            try:
+                with st.spinner("正在从中断位置继续生成..."):
+                    continuation = "".join(api_continue4_stream(api_text, settings["key"], settings["base_url"], settings["model"], settings["timeout"], settings.get("wire_api", "responses"), settings.get("reasoning_effort", "medium")))
+                st.session_state["api4_result"] = api_text + continuation
+                st.session_state["api4_partial_result"] = ""
+                st.session_state["api4_interrupted"] = False
+                st.rerun()
+            except Exception as error:
+                st.error(f"{classify_api_error(error)}\n\n详细信息：{error}")
 elif api_mode:
     st.info("尚未获得 API 结果。请确认已配置 API，并点击“调用 API 分析”。")
+
+active_plans = result["plans"]
+active_similarity = result["similarity"]
+if st.session_state.get("api4_result"):
+    parsed_api_plans = parse_api_plans(st.session_state.get("edited_api4_result", st.session_state["api4_result"]))
+    if parsed_api_plans:
+        active_plans = parsed_api_plans
+        active_similarity = check_similarity(active_plans, posts)
+        st.success(f"已将 {len(active_plans)} 条 API 内容计划接入后续审核、导出和相似度检查流程。")
+    else:
+        st.warning("API 结果中未识别到完整的内容计划，后续流程暂使用本地规则计划。请按固定模板补充计划字段。")
 
 st.subheader("1. 对标账号画像")
 st.dataframe(result["profiles"], use_container_width=True, hide_index=True)
@@ -98,15 +150,15 @@ with right:
     for item in result["opportunities"]: st.write("- " + item)
 
 st.subheader("6. 原创差异化内容计划")
-st.dataframe(result["plans"], use_container_width=True, hide_index=True)
-st.download_button("导出内容计划 CSV", "\ufeff" + "\n".join(",".join(str(item[field]).replace(",", "，") for field in item) for item in result["plans"]), "xiaohongshu4_content_plan.csv", "text/csv")
+st.dataframe(active_plans, use_container_width=True, hide_index=True)
+st.download_button("导出内容计划 CSV", "\ufeff" + "\n".join(",".join(str(item[field]).replace(",", "，") for field in item) for item in active_plans), "xiaohongshu4_content_plan.csv", "text/csv")
 
 st.subheader("7. 可复用内容模板")
 st.dataframe(content_templates(), use_container_width=True, hide_index=True)
 
 st.subheader("8. 人工审核")
 st.caption("请逐条选择采纳或驳回，并填写理由。审核记录会保存到本地 reviews.db，后续用于总结规律和风险提醒。")
-for plan in result["plans"]:
+for plan in active_plans:
     with st.container(border=True):
         st.markdown(f"**{plan['plan_id']}｜{plan['title']}**")
         st.write(f"角度：{plan['angle']} ｜ Hook：{plan['hook']}")
@@ -154,7 +206,7 @@ if own_compare:
     for gap in own_compare["gaps"]: st.write("- " + gap)
 
 st.subheader("11. 生成内容相似度与抄袭风险")
-st.dataframe(result["similarity"], use_container_width=True, hide_index=True)
+st.dataframe(active_similarity, use_container_width=True, hide_index=True)
 st.caption("第 11 点同时检查生成标题、内容关键词、对标内容关键词/片段和结构；相似度只是初筛指标，不等同于法律意义上的抄袭结论。")
 
 st.subheader("12. 根据后续表现调整学习策略")
